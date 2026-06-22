@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout ce-pin
+        uses: actions/checkout@v4
+        with:
+          path: ce-pin
+
+      # ce-pin path-depends on ce-rs (../ce-rs) and on ce/crates/ce-cap +
+      # ce/crates/ce-identity (inside ../ce). Check both siblings out next to it so
+      # the path dependencies resolve in CI exactly as they do on a dev workspace.
+      - name: Checkout ce-rs (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-rs
+          path: ce-rs
+
+      - name: Checkout ce (path dependency — provides ce-cap + ce-identity)
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce
+          path: ce
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ce-pin
+
+      - name: cargo build
+        working-directory: ce-pin
+        run: cargo build --verbose
+
+      - name: cargo test
+        working-directory: ce-pin
+        run: cargo test --verbose

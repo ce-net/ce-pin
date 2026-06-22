@@ -103,6 +103,13 @@ cargo build --release
 ./examples/demo.sh
 ```
 
+On Windows (or any platform with PowerShell 7+), run the cross-platform equivalent:
+
+```powershell
+cargo build --release
+pwsh examples/demo.ps1
+```
+
 ## Architecture
 
 ```

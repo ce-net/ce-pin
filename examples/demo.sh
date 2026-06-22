@@ -10,6 +10,9 @@
 # Requirements: a `ce` binary on PATH (the CE node) and `ce-pin` built (`cargo build --release`).
 # This script is illustrative and defensive: it explains each step and cleans up on exit. Adjust the
 # `ce` invocation flags to match your local node CLI if they differ.
+#
+# Windows users: run the cross-platform PowerShell equivalent instead — `examples/demo.ps1`
+# (PowerShell 7+; also runs on macOS/Linux via `pwsh`).
 
 set -euo pipefail
 
