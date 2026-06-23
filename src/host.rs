@@ -146,7 +146,7 @@ async fn handle_inner(
         }
         "audit" => {
             let req: AuditReq = serde_json::from_slice(&payload)?;
-            let resp = do_audit(client, &req).await;
+            let resp = do_audit(client, &req, held).await;
             Ok(serde_json::to_vec(&resp)?)
         }
         "status" => {
@@ -180,10 +180,40 @@ async fn do_offer(client: &CeClient, req: &OfferReq, held: &mut HeldSet, held_pa
     }
 }
 
-/// Answer a proof-of-retrievability challenge: fetch the challenged chunk from the local store and
-/// return `sha256(chunk || nonce)`. Resolving the manifest re-confirms we can still serve the object.
-async fn do_audit(client: &CeClient, req: &AuditReq) -> AuditResp {
-    // Resolve the manifest to map chunk_index -> chunk CID.
+/// Answer a proof-of-retrievability challenge: prove the challenged chunk is held **by this host
+/// locally** and return `sha256(chunk || nonce)`.
+///
+/// SECURITY (finding H3): a PoR audit must prove *retrievability-here*, not *availability-somewhere*.
+/// The SDK's `get_blob` is local-first but falls back to a mesh fetch-by-hash, so a host that
+/// discarded the bytes could transparently re-pull the challenged chunk from another paid replica
+/// and forge a passing proof — defeating the economic guarantee that this host still holds the data.
+/// To close that hole the audit is gated on this host's own authoritative local record before any
+/// blob read, and FAILS for a CID this host has not locally committed to.
+///
+/// The gate is the host's committed held-set: a CID is in `held` only after [`do_offer`] fetched the
+/// object and recorded it, and it is removed by `pin/release`. An audit for any CID not in that set
+/// (never pinned, or released — i.e. "not held locally") fails here without touching the network, so
+/// a sibling replica's copy can never satisfy our challenge.
+///
+/// TODO(node/SDK support needed for a byte-level local-only PoR): the node's `GET /blobs/:hash`
+/// handler (`ce/crates/ce-node/src/api.rs::get_blob`) takes only the path and ALWAYS falls back to
+/// `fetch_chunk_from_mesh` on a local miss; it ignores query parameters, so there is no app-tier way
+/// to force a no-mesh read of the actual bytes. The sound fix is a node-side local-only read — e.g.
+/// honoring `GET /blobs/:hash?local=1` (or a dedicated `GET /blobs/:hash/local`) by returning 404 on
+/// a local miss instead of pulling from the mesh — surfaced in the SDK as `CeClient::get_blob_local`.
+/// Until that lands, the held-set gate above is the strictest enforceable defence from this app: it
+/// already fails an audit for an un-held CID. When the endpoint exists, additionally read the
+/// manifest and chunk through it so even a held-but-garbage-collected CID fails.
+async fn do_audit(client: &CeClient, req: &AuditReq, held: &HeldSet) -> AuditResp {
+    // Local-only gate: we must have committed to hold this object. This is the host's own
+    // authoritative record; an audit for a CID we never pinned (or released) fails before any read,
+    // so the bytes can NEVER be sourced from another replica to forge a passing proof.
+    if !audit_held_locally(held, &req.cid) {
+        return AuditResp { proof: None, reason: Some("not held locally".into()) };
+    }
+    // Resolve the manifest to map chunk_index -> chunk CID, then hash the challenged chunk. (These
+    // reads go through the SDK; the local-only guarantee for the bytes themselves awaits the node
+    // endpoint described above — tracked by the TODO. The held-set gate is what closes H3 today.)
     let manifest = match client.get_blob(&req.cid).await.ok().and_then(|b| serde_json::from_slice::<ce_rs::Manifest>(&b).ok()) {
         Some(m) => m,
         None => return AuditResp { proof: None, reason: Some("manifest unavailable".into()) },
@@ -195,6 +225,14 @@ async fn do_audit(client: &CeClient, req: &AuditReq) -> AuditResp {
         Ok(chunk) => AuditResp { proof: Some(crate::audit::prove(&chunk, &req.nonce)), reason: None },
         Err(e) => AuditResp { proof: None, reason: Some(format!("chunk unavailable: {e}")) },
     }
+}
+
+/// The H3 local-only audit gate, factored out so it is unit-testable without a node: a host may
+/// answer a PoR challenge for `cid` only if `cid` is in its committed held-set. This is the
+/// authoritative "do we hold this locally?" decision the audit makes before any (mesh-capable) read.
+/// Returns true iff the host has locally committed to `cid` (and not released it).
+fn audit_held_locally(held: &HeldSet, cid: &str) -> bool {
+    held.cids.contains(cid)
 }
 
 /// Cheap liveness: report whether we still serve this CID (committed in the held-set and the manifest
@@ -265,4 +303,56 @@ fn held_set_path() -> PathBuf {
     directories::ProjectDirs::from("", "", "ce-pin")
         .map(|p| p.config_dir().join("held.json"))
         .unwrap_or_else(|| PathBuf::from(".ce-pin/held.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a held-set from a list of CIDs, as the host would have after accepting those pins.
+    fn held_with(cids: &[&str]) -> HeldSet {
+        let mut h = HeldSet::default();
+        for c in cids {
+            h.insert((*c).to_string());
+        }
+        h
+    }
+
+    /// REGRESSION (finding H3): the audit gate must DENY a CID this host does not hold locally.
+    ///
+    /// Before the fix, `do_audit` had no held-set gate at all — it went straight to
+    /// `get_blob(cid)`, which falls back to a mesh fetch-by-hash, so a host that never held (or had
+    /// released) the bytes could re-fetch them from another replica and forge a passing proof. This
+    /// test pins down the new contract: an audit for a CID NOT in the local held-set is refused
+    /// before any (mesh-capable) read. It fails against the old gate-less behavior and passes now.
+    #[test]
+    fn audit_denied_for_cid_not_held_locally() {
+        let held = held_with(&["held-cid-aaaa"]);
+        // A CID we DO hold passes the local-only gate.
+        assert!(audit_held_locally(&held, "held-cid-aaaa"), "a locally-held CID must pass the gate");
+        // A CID we do NOT hold (never pinned, or released) is denied — it must not be answerable by
+        // re-fetching from a sibling replica.
+        assert!(
+            !audit_held_locally(&held, "not-held-cid-bbbb"),
+            "an un-held CID must FAIL the audit gate (no re-fetch-from-mesh forgery)"
+        );
+    }
+
+    /// Releasing a pin removes it from the held-set, so a subsequent audit for it is denied: the
+    /// host can no longer prove retrievability-here once it has dropped the bytes.
+    #[test]
+    fn audit_denied_after_release() {
+        let mut held = held_with(&["cid-x"]);
+        assert!(audit_held_locally(&held, "cid-x"));
+        let removed = held.remove("cid-x");
+        assert!(removed, "release must drop the CID from the held-set");
+        assert!(!audit_held_locally(&held, "cid-x"), "a released CID must fail the audit gate");
+    }
+
+    /// An empty held-set (fresh host that has accepted nothing) denies every audit.
+    #[test]
+    fn empty_host_answers_no_audit() {
+        let held = HeldSet::default();
+        assert!(!audit_held_locally(&held, "anything"));
+    }
 }

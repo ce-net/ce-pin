@@ -252,6 +252,25 @@ async fn pin_offer_audit_status_round_trip_across_two_nodes() {
     assert!(!denied.accepted, "an offer with NO capability must be denied");
     assert!(denied.reason.is_some(), "denial must carry a reason");
 
+    // --- 5. REGRESSION (finding H3): audit for a CID the host NEVER pinned must FAIL ---
+    // Publish a SECOND object on A but do NOT offer it to B, so B has it in neither its held-set nor
+    // (initially) its local blob store. The auditor (A) holds it, so `audit_replica` can form a valid
+    // challenge. Before the fix, B's `do_audit` went straight to `get_blob`, whose mesh fetch-by-hash
+    // fallback would pull the chunk from A and forge a PASSING proof — proving availability-somewhere,
+    // not retrievability-on-B. With the held-set gate, B refuses (no proof) because cid2 is not held
+    // locally. The auditor authorized to audit (`ABILITY_AUDIT` granted above) reaches the gate, so a
+    // denial here is the gate firing, not an authorization failure.
+    let payload2: Vec<u8> = (0..6000u32).map(|i| (i % 241) as u8).collect();
+    let cid2 = client_a.put_object(&payload2).await.expect("put_object cid2 on A");
+    assert_ne!(cid2, cid, "the un-pinned object must be a distinct CID");
+    let audited2 = ce_pin::client::audit_replica(&client_a, &b_node_id, &caps_token, &cid2)
+        .await
+        .expect("audit_replica call for an un-pinned cid still returns a structured reply");
+    assert!(
+        !audited2,
+        "a host that never pinned the CID must FAIL the PoR audit (no re-fetch-from-mesh forgery)"
+    );
+
     serve_handle.abort();
     // node_a / node_b dropped here -> killed + temp dirs removed.
 }
