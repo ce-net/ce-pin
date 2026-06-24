@@ -55,6 +55,27 @@ pub struct Entry {
 
 impl Entry {
     /// Count of replicas whose last audit passed (the live replication factor).
+    ///
+    /// ```
+    /// use ce_pin::pinset::{Entry, PinJob, Replica};
+    /// let entry = Entry {
+    ///     job: PinJob {
+    ///         cid: "deadbeef".into(),
+    ///         bytes_len: 1024,
+    ///         replication: 3,
+    ///         rent_per_gb_hour: "1000000000000000".into(),
+    ///         expiry_height: 8640,
+    ///         label: None,
+    ///     },
+    ///     replicas: vec![
+    ///         Replica { holder: "host-a".into(), channel_id: String::new(), last_proof_ok: true },
+    ///         Replica { holder: "host-b".into(), channel_id: String::new(), last_proof_ok: false },
+    ///     ],
+    /// };
+    /// // Only the replica that passed its last audit counts toward the live factor.
+    /// assert_eq!(entry.healthy_replicas(), 1);
+    /// assert!(entry.healthy_replicas() < entry.job.replication as usize); // under-replicated
+    /// ```
     pub fn healthy_replicas(&self) -> usize {
         self.replicas.iter().filter(|r| r.last_proof_ok).count()
     }
@@ -91,15 +112,15 @@ impl PinSet {
     }
 
     /// Persist the pin-set to `path`, creating parent directories as needed. Written
-    /// pretty-printed so a human can inspect it.
+    /// pretty-printed (human-inspectable) and **atomically** (temp file + fsync + rename), so a crash
+    /// or a concurrent reader never sees a truncated `pins.json`.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_vec_pretty(self)?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        crate::held::atomic_write(path, &json).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Insert or replace an entry by CID.

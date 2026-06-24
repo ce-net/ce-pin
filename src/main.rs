@@ -58,6 +58,10 @@ enum Cmd {
         /// Skip replication — just publish to the local data layer and record the CID.
         #[arg(long)]
         no_replicate: bool,
+        /// Refuse to publish a file larger than this many bytes (guards against accidentally
+        /// loading a huge file into memory). Default 4 GiB; set 0 to disable the guard.
+        #[arg(long, default_value_t = 4 * 1024 * 1024 * 1024)]
+        max_size: u64,
     },
     /// Fetch an object by CID and write it to a file (or stdout-path).
     Get {
@@ -85,10 +89,44 @@ enum Cmd {
         #[arg(long)]
         audit: bool,
     },
-    /// Remove a CID from the local pin-set (does not force hosts to drop it).
+    /// Remove a CID from the local pin-set. By default also asks current holders to release it
+    /// (closing their rent channels); pass `--local` to only forget it locally.
     Rm {
         /// The object CID to forget.
         cid: String,
+        /// Only forget locally; do NOT send pin/release to holders.
+        #[arg(long)]
+        local: bool,
+        /// Capability chain (hex) presented to holders for the release (gates `pin:release`).
+        #[arg(long)]
+        caps: Option<String>,
+    },
+    /// Extend the rent lease on a pinned CID across its holders (and top up its expiry locally).
+    Renew {
+        /// The object CID to renew.
+        cid: String,
+        /// Additional blocks to extend the lease by (added to the current chain tip).
+        #[arg(long, default_value_t = 8640)]
+        expiry_blocks: u64,
+        /// Optional new rent rate in credits per GB-hour (keeps the existing rate if omitted).
+        #[arg(long)]
+        rent: Option<String>,
+        /// Capability chain (hex) presented to holders (gates `pin:store`).
+        #[arg(long)]
+        caps: Option<String>,
+    },
+    /// Run the auto re-replication / repair daemon: periodically audit each pin and re-pin any that
+    /// have fallen below their desired replication factor, paying accrued rent on healthy channels.
+    Watch {
+        /// Seconds between repair passes.
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
+        /// Run a single repair pass and exit (do not loop).
+        #[arg(long)]
+        once: bool,
+        /// Capability chain (hex) presented to hosts for audits/re-replication.
+        #[arg(long)]
+        caps: Option<String>,
     },
     /// Run as a pinning host: accept cap-gated pins, answer audits, earn rent.
     Serve,
@@ -102,18 +140,23 @@ async fn main() -> Result<()> {
     let pinset_path = cli.pinset.clone().unwrap_or_else(PinSet::default_path);
 
     match cli.cmd {
-        Cmd::Add { file, replication, rent, expiry_blocks, label, caps: caps_arg, no_replicate } => {
-            cmd_add(&client, &pinset_path, &file, replication, &rent, expiry_blocks, label, caps_arg.as_deref(), no_replicate).await
+        Cmd::Add { file, replication, rent, expiry_blocks, label, caps: caps_arg, no_replicate, max_size } => {
+            cmd_add(&client, &pinset_path, &file, replication, &rent, expiry_blocks, label, caps_arg.as_deref(), no_replicate, max_size).await
         }
         Cmd::Get { cid, out } => cmd_get(&client, &cid, out).await,
         Cmd::Ls => cmd_ls(&pinset_path),
         Cmd::Announce { cid } => cmd_announce(&client, &cid).await,
         Cmd::Status { cid, caps: caps_arg, audit } => cmd_status(&client, &pinset_path, &cid, caps_arg.as_deref(), audit).await,
-        Cmd::Rm { cid } => cmd_rm(&pinset_path, &cid),
+        Cmd::Rm { cid, local, caps: caps_arg } => cmd_rm(&client, &pinset_path, &cid, local, caps_arg.as_deref()).await,
+        Cmd::Renew { cid, expiry_blocks, rent, caps: caps_arg } => {
+            cmd_renew(&client, &pinset_path, &cid, expiry_blocks, rent.as_deref(), caps_arg.as_deref()).await
+        }
+        Cmd::Watch { interval, once, caps: caps_arg } => cmd_watch(&client, &pinset_path, interval, once, caps_arg.as_deref()).await,
         Cmd::Serve => ce_pin::host::serve(&client, load_roots()).await,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_add(
     client: &CeClient,
     pinset_path: &std::path::Path,
@@ -124,7 +167,18 @@ async fn cmd_add(
     label: Option<String>,
     caps_arg: Option<&str>,
     no_replicate: bool,
+    max_size: u64,
 ) -> Result<()> {
+    // Guard against accidentally loading a huge file into memory before reading it.
+    let meta = std::fs::metadata(file).with_context(|| format!("stat {}", file.display()))?;
+    if max_size > 0 && meta.len() > max_size {
+        return Err(anyhow!(
+            "{} is {} bytes, over the --max-size limit of {} bytes (raise it or set 0 to disable)",
+            file.display(),
+            meta.len(),
+            max_size
+        ));
+    }
     let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     // Rent: parse human credit decimals -> base units (integer), stored as a decimal string.
     let rent = Amount::parse_credits(rent_credits)
@@ -239,13 +293,15 @@ async fn cmd_status(
         return Ok(());
     }
 
-    let mut live = 0usize;
+    // Track the health of EACH holder individually so the write-back is per-replica, not a global
+    // "any live" flag (which would mark a failed replica healthy just because a sibling passed).
+    let mut healthy_holders: Vec<String> = Vec::new();
     for host in &all {
         let short = &host[..16.min(host.len())];
         if do_audit {
             match pin_client::audit_replica(client, host, &caps_hex, cid).await {
                 Ok(true) => {
-                    live += 1;
+                    healthy_holders.push(host.clone());
                     println!("  {short}…  PROOF OK (retrievable)");
                 }
                 Ok(false) => println!("  {short}…  PROOF FAILED (not retrievable)"),
@@ -254,7 +310,7 @@ async fn cmd_status(
         } else {
             match pin_client::probe_status(client, host, &caps_hex, cid).await {
                 Ok(s) if s.held => {
-                    live += 1;
+                    healthy_holders.push(host.clone());
                     println!("  {short}…  HELD ({} bytes)", s.bytes);
                 }
                 Ok(_) => println!("  {short}…  not held"),
@@ -262,13 +318,14 @@ async fn cmd_status(
             }
         }
     }
-    println!("retrievable from {live}/{} holder(s)", all.len());
+    println!("retrievable from {}/{} holder(s)", healthy_holders.len(), all.len());
 
-    // Reflect the freshly-measured health back into the pin-set, if we track this CID.
+    // Reflect the freshly-measured PER-REPLICA health back into the pin-set, if we track this CID.
     if let Ok(mut set) = PinSet::load(pinset_path) {
         if let Some(e) = set.get_mut(cid) {
             for r in e.replicas.iter_mut() {
-                r.last_proof_ok = all.contains(&r.holder) && live > 0 && holders.contains(&r.holder);
+                // This replica is healthy iff its OWN probe/audit passed this round.
+                r.last_proof_ok = healthy_holders.contains(&r.holder);
             }
             let _ = set.save(pinset_path);
         }
@@ -276,16 +333,117 @@ async fn cmd_status(
     Ok(())
 }
 
-fn cmd_rm(pinset_path: &std::path::Path, cid: &str) -> Result<()> {
+async fn cmd_rm(
+    client: &CeClient,
+    pinset_path: &std::path::Path,
+    cid: &str,
+    local_only: bool,
+    caps_arg: Option<&str>,
+) -> Result<()> {
     let mut set = PinSet::load(pinset_path)?;
-    match set.remove(cid) {
-        Some(_) => {
-            set.save(pinset_path)?;
-            println!("removed {cid} from the pin-set");
-            Ok(())
+    let entry = set.remove(cid).ok_or_else(|| anyhow!("{cid} is not in the pin-set"))?;
+    set.save(pinset_path)?;
+
+    if !local_only {
+        // Tell each holder to drop the pin and close its rent channel. Best-effort: a holder that is
+        // unreachable simply keeps the bytes until its lease expires (the host GCs it).
+        let caps_hex = caps::resolve(caps_arg);
+        let mut released = 0usize;
+        for r in &entry.replicas {
+            let short = &r.holder[..16.min(r.holder.len())];
+            match pin_client::release(client, r, &caps_hex, cid).await {
+                Ok(resp) if resp.released => {
+                    released += 1;
+                    println!("  {short}…  released");
+                    // Close the rent channel by redeeming nothing further (host settles on its side).
+                    if !r.channel_id.is_empty() {
+                        let _ = client.channel_expire(&r.channel_id).await;
+                    }
+                }
+                Ok(_) => println!("  {short}…  was not holding it"),
+                Err(e) => println!("  {short}…  release failed: {e}"),
+            }
         }
-        None => Err(anyhow!("{cid} is not in the pin-set")),
+        println!("released from {released}/{} holder(s)", entry.replicas.len());
     }
+    println!("removed {cid} from the pin-set");
+    Ok(())
+}
+
+async fn cmd_renew(
+    client: &CeClient,
+    pinset_path: &std::path::Path,
+    cid: &str,
+    expiry_blocks: u64,
+    rent_credits: Option<&str>,
+    caps_arg: Option<&str>,
+) -> Result<()> {
+    let mut set = PinSet::load(pinset_path)?;
+    let entry = set.get(cid).cloned().ok_or_else(|| anyhow!("{cid} is not in the pin-set"))?;
+
+    let tip = client.status().await.map(|s| s.height).unwrap_or(0);
+    let new_expiry = tip + expiry_blocks;
+    // Resolve the (optional) new rent rate to base units.
+    let rent_base = match rent_credits {
+        Some(c) => Amount::parse_credits(c)
+            .with_context(|| format!("parsing --rent '{c}'"))?
+            .base()
+            .to_string(),
+        None => entry.job.rent_per_gb_hour.clone(),
+    };
+    let caps_hex = caps::resolve(caps_arg);
+
+    let mut renewed = 0usize;
+    for r in &entry.replicas {
+        let short = &r.holder[..16.min(r.holder.len())];
+        match pin_client::renew(client, &r.holder, &caps_hex, cid, new_expiry, &rent_base).await {
+            Ok(resp) if resp.renewed => {
+                renewed += 1;
+                println!("  {short}…  renewed to height {}", resp.expiry_height);
+            }
+            Ok(resp) => println!("  {short}…  not renewed: {:?}", resp.reason),
+            Err(e) => println!("  {short}…  renew failed: {e}"),
+        }
+    }
+
+    // Update the local lease/rent record.
+    if let Some(e) = set.get_mut(cid) {
+        e.job.expiry_height = new_expiry;
+        e.job.rent_per_gb_hour = rent_base;
+        set.save(pinset_path)?;
+    }
+    println!("renewed {cid} on {renewed}/{} holder(s); lease now to height {new_expiry}", entry.replicas.len());
+    Ok(())
+}
+
+async fn cmd_watch(
+    client: &CeClient,
+    pinset_path: &std::path::Path,
+    interval_secs: u64,
+    once: bool,
+    caps_arg: Option<&str>,
+) -> Result<()> {
+    let caps_hex = caps::resolve(caps_arg);
+    if once {
+        let report = ce_pin::repair::repair_once(client, pinset_path, &caps_hex).await?;
+        println!(
+            "repair pass: {} pin(s) checked, {} repaired, {} replica(s) added, {} unhealthy",
+            report.pins_checked, report.pins_repaired, report.replicas_added, report.replicas_unhealthy
+        );
+        return Ok(());
+    }
+    // Loop until Ctrl-C.
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    ce_pin::repair::watch(
+        client,
+        pinset_path,
+        &caps_hex,
+        std::time::Duration::from_secs(interval_secs.max(1)),
+        cancel,
+    )
+    .await
 }
 
 /// Initialize tracing once; level from `$RUST_LOG`, defaulting to `info`.

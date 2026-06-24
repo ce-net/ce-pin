@@ -165,6 +165,14 @@ async fn pin_offer_audit_status_round_trip_across_two_nodes() {
         return;
     };
 
+    // Isolate the host's held-set in a temp dir so the test never touches the user's real config.
+    let pin_dir = std::env::temp_dir().join(format!("ce-pin-live-held-{}-{}", std::process::id(), rand_suffix()));
+    std::fs::create_dir_all(&pin_dir).unwrap();
+    // SAFETY: this test is the sole user of the process env here; set before spawning serve().
+    unsafe {
+        std::env::set_var("CE_PIN_DIR", &pin_dir);
+    }
+
     // --- Node A (publisher) ---
     let api_a = 18960;
     let p2p_a = 14960;
@@ -219,10 +227,19 @@ async fn pin_offer_audit_status_round_trip_across_two_nodes() {
     );
     let caps_token = encode_chain(&[cap]);
 
-    // Run B's REAL host loop in the background (rooted at its own key — empty extra roots).
+    // Run B's REAL host loop in the background (rooted at its own key — empty extra roots). Use a
+    // tight admission config so we can exercise the size limit in this same test without a huge file.
     let serve_client = node_b.client();
+    let serve_cfg = ce_pin::config::HostConfig {
+        max_object_bytes: 100_000, // our test payload (5000 bytes) fits; a giant declared size won't
+        capacity_bytes: 10_000_000,
+        min_rent_per_gb_hour: 0,
+        max_concurrent: 4,
+        fetch_timeout: std::time::Duration::from_secs(30),
+        seen_window: 4096,
+    };
     let serve_handle = tokio::spawn(async move {
-        let _ = ce_pin::host::serve(&serve_client, Vec::new()).await;
+        let _ = ce_pin::host::serve_with(&serve_client, Vec::new(), serve_cfg).await;
     });
     // Give the loop a moment to advertise + subscribe.
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -270,6 +287,48 @@ async fn pin_offer_audit_status_round_trip_across_two_nodes() {
         !audited2,
         "a host that never pinned the CID must FAIL the PoR audit (no re-fetch-from-mesh forgery)"
     );
+
+    // --- 6. Admission control: an offer whose DECLARED size exceeds the host max is declined
+    //        BEFORE any fetch (the host never pulls a giant object on a publisher's say-so). ---
+    let oversized = ce_pin::client::offer(
+        &client_a,
+        &b_node_id,
+        &caps_token,
+        &cid,
+        1_000_000, // declared > the 100_000 max_object_bytes configured above
+        "1000000000000000",
+        0,
+    )
+    .await
+    .expect("offer call returns a structured reply");
+    assert!(!oversized.accepted, "an over-max declared size must be declined by admission control");
+    assert!(
+        oversized.reason.as_deref().map(|r| r.contains("too large")).unwrap_or(false),
+        "decline reason should name the size limit: {:?}",
+        oversized.reason
+    );
+
+    // --- 7. Renew: extend the lease on the held CID. The host must report the new expiry. ---
+    let renewed = ce_pin::client::renew(&client_a, &b_node_id, &caps_token, &cid, 99_999, "")
+        .await
+        .expect("renew call");
+    assert!(renewed.renewed, "host must renew a held CID");
+    assert_eq!(renewed.expiry_height, 99_999, "host records the extended lease");
+
+    // --- 8. Release: drop the pin; a subsequent status must report it is no longer held. ---
+    let replica = ce_pin::pinset::Replica {
+        holder: b_node_id.clone(),
+        channel_id: String::new(),
+        last_proof_ok: true,
+    };
+    let released = ce_pin::client::release(&client_a, &replica, &caps_token, &cid)
+        .await
+        .expect("release call");
+    assert!(released.released, "host must release a CID it holds");
+    let after = ce_pin::client::probe_status(&client_a, &b_node_id, &caps_token, &cid)
+        .await
+        .expect("status after release");
+    assert!(!after.held, "a released CID must no longer be reported held");
 
     serve_handle.abort();
     // node_a / node_b dropped here -> killed + temp dirs removed.

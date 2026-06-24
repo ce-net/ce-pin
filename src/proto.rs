@@ -22,6 +22,9 @@ pub const ABILITY_READ: &str = "pin:read";
 pub const ABILITY_AUDIT: &str = "pin:audit";
 /// Ability: drop a previously-accepted pin.
 pub const ABILITY_RELEASE: &str = "pin:release";
+/// Ability: extend the rent lease on a held pin (renew). Requires `pin:store` semantics — a renewer
+/// is re-committing the host to keep the bytes, so the host gates it on the same `pin:store` ability.
+pub const ABILITY_RENEW: &str = "pin:store";
 
 /// The DHT service string a pinning host advertises for a given object, so fetchers can discover
 /// replica holders without a central tracker (`advertise_service` / `find_service`).
@@ -58,6 +61,31 @@ pub struct OfferResp {
     #[serde(default)]
     pub stored_bytes: u64,
     /// Human-readable reason when `accepted == false`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `pin/renew` request: extend an existing pin's rent lease to a later `expiry_height`. The publisher
+/// sends this before the old lease lapses so the host keeps (and keeps advertising) the object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewReq {
+    pub caps: String,
+    pub cid: String,
+    /// The new (later) block height the rent lease extends to.
+    pub expiry_height: u64,
+    /// Optional updated rent rate (base units / GB-hour); empty keeps the existing rate.
+    #[serde(default)]
+    pub rent_per_gb_hour: String,
+}
+
+/// `pin/renew` reply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RenewResp {
+    /// Whether the host renewed (it must still hold the CID).
+    pub renewed: bool,
+    /// The host's resulting expiry height after the renew (0 if not renewed).
+    #[serde(default)]
+    pub expiry_height: u64,
     #[serde(default)]
     pub reason: Option<String>,
 }

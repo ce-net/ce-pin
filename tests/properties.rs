@@ -110,7 +110,7 @@ proptest! {
         ),
     ) {
         let cands: Vec<Candidate> = cands.into_iter().enumerate().map(|(i, (w, s, m, id))| {
-            Candidate { node_id: format!("{id}-{i}"), delivered_work: w, last_seen_secs: s, mem_mb: m }
+            Candidate { node_id: format!("{id}-{i}"), delivered_work: w, last_seen_secs: s, mem_mb: m, fault_domain: String::new() }
         }).collect();
         let once = rank(&cands);
         let twice = rank(&once);
@@ -137,7 +137,7 @@ proptest! {
         exclude_idx in proptest::collection::vec(0usize..30, 0..5),
     ) {
         let cands: Vec<Candidate> = cands.iter().enumerate().map(|(i, id)| {
-            Candidate { node_id: format!("{id}-{i}"), delivered_work: i as u64, last_seen_secs: 0, mem_mb: 1 }
+            Candidate { node_id: format!("{id}-{i}"), delivered_work: i as u64, last_seen_secs: 0, mem_mb: 1, fault_domain: String::new() }
         }).collect();
         let exclude: Vec<String> = exclude_idx.into_iter()
             .filter_map(|i| cands.get(i).map(|c| c.node_id.clone())).collect();

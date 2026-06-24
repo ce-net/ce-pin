@@ -3,119 +3,224 @@
 //! It polls the local node's mesh inbox for `pin/*` requests, authorizes each against a signed
 //! `ce-cap` chain (rooted at this host's own key or a configured org root — the rdev `serve()`
 //! pattern, verbatim), and acts:
-//!   - `pin/offer`   -> fetch the object via `get_object` (CID-verified, trustless), hold it, accept;
-//!   - `pin/audit`   -> answer a proof-of-retrievability challenge from local bytes;
+//!   - `pin/offer`   -> admission-check (size/rent/capacity), fetch the object via `get_object`
+//!                      (CID-verified, trustless), hold it with accounting, accept;
+//!   - `pin/audit`   -> answer a proof-of-retrievability challenge from local bytes (gated on the
+//!                      committed held-set so the bytes can never be re-sourced from a sibling replica);
 //!   - `pin/status`  -> cheap liveness: do we still hold this CID?
+//!   - `pin/renew`   -> extend the rent lease on a held CID;
 //!   - `pin/release` -> drop the pin.
 //!
-//! Holding is "logical": the node's content-addressed blob store already persists the chunks
-//! `get_object` pulled, so the host records which CIDs it has committed to keep (in a small held-set
-//! file) and re-fetches on demand. The MVP does not garbage-collect blobs; a real host would.
+//! Robustness properties (vs the original MVP):
+//!   * **Admission control** ([`crate::config::HostConfig`]): rejects oversized objects, below-minimum
+//!     rent, and offers that would exceed the host's disk budget — closing the DoS / pricing-fiction.
+//!   * **Capacity accounting + GC**: the held-set tracks bytes per CID; a background loop evicts
+//!     expired-then-lowest-rent-then-LRU pins to stay under budget and drops past-lease pins.
+//!   * **Concurrency**: `pin/*` requests are served on a bounded worker pool (a [`tokio::sync::Semaphore`]),
+//!     removing the head-of-line blocking of the old single-task loop; the held-set is an
+//!     `Arc<Mutex<..>>` so concurrent handlers are race-free, and each offer's fetch has a timeout.
+//!   * **Bounded memory**: the de-dup `seen` reply-token window is size-capped (FIFO eviction), so a
+//!     long-lived host does not leak.
+//!   * **Atomic, corruption-safe persistence**: the held-set is written temp-file + fsync + rename and
+//!     a corrupt file is preserved (not silently dropped).
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use ce_cap::{SignedCapability, authorize, decode_chain};
 use ce_rs::CeClient;
+use tokio::sync::{Mutex, Semaphore};
 
+use crate::config::HostConfig;
+use crate::held::{HeldEntry, HeldSet};
+use crate::metrics::HostMetrics;
 use crate::proto::*;
+
+/// Shared host state passed to every request handler. Cheap to clone (all `Arc`).
+#[derive(Clone)]
+struct HostState {
+    host_id: [u8; 32],
+    roots: Arc<Vec<[u8; 32]>>,
+    revoked: Arc<Mutex<HashSet<([u8; 32], u64)>>>,
+    held: Arc<Mutex<HeldSet>>,
+    held_path: Arc<PathBuf>,
+    cfg: Arc<HostConfig>,
+    metrics: Arc<HostMetrics>,
+}
 
 /// Run the pinning host loop until the process is killed. `roots` are accepted capability root
 /// NodeIds (32-byte); a chain rooted at one of them (or at this host's own key) authorizes actions.
+/// Configuration (size/rent/capacity/concurrency) is read from `CE_PIN_*` env vars; see
+/// [`HostConfig::from_env`].
 pub async fn serve(client: &CeClient, roots: Vec<[u8; 32]>) -> Result<()> {
+    serve_with(client, roots, HostConfig::from_env()).await
+}
+
+/// As [`serve`] but with an explicit [`HostConfig`] (used by tests to inject tight limits).
+pub async fn serve_with(client: &CeClient, roots: Vec<[u8; 32]>, cfg: HostConfig) -> Result<()> {
     let host_hex = client.status().await?.node_id;
     let host_id: [u8; 32] = hex::decode(&host_hex)
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow!("node returned a malformed node id"))?;
 
-    // Advertise on the DHT that we are a pinning host so clients can discover us.
     if let Err(e) = client.advertise_service(SERVICE_HOST).await {
         tracing::warn!(error = %e, "could not advertise pin:host service (continuing)");
     }
-    // Subscribe so directed requests on the pin topics land in our inbox.
-    let held_path = held_set_path();
-    let mut held = HeldSet::load(&held_path)?;
-    tracing::info!(host = %&host_hex[..16.min(host_hex.len())], roots = roots.len(),
-        held = held.cids.len(), "ce-pin host serving (pin/offer, pin/audit, pin/status, pin/release)");
 
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut revoked: HashSet<([u8; 32], u64)> = HashSet::new();
+    let held_path = held_set_path();
+    let held = HeldSet::load(&held_path)?;
+    tracing::info!(
+        host = %&host_hex[..16.min(host_hex.len())],
+        roots = roots.len(),
+        held = held.len(),
+        held_bytes = held.total_bytes(),
+        capacity = cfg.capacity_bytes,
+        max_object = cfg.max_object_bytes,
+        min_rent = cfg.min_rent_per_gb_hour,
+        concurrency = cfg.max_concurrent,
+        "ce-pin host serving (offer/audit/status/renew/release)"
+    );
+
+    let state = HostState {
+        host_id,
+        roots: Arc::new(roots),
+        revoked: Arc::new(Mutex::new(HashSet::new())),
+        held: Arc::new(Mutex::new(held)),
+        held_path: Arc::new(held_path),
+        cfg: Arc::new(cfg),
+        metrics: Arc::new(HostMetrics::new()),
+    };
+
+    let sem = Arc::new(Semaphore::new(state.cfg.max_concurrent));
+    // Bounded de-dup window: a FIFO of recently-seen reply tokens, capped so memory cannot grow.
+    let mut seen: SeenWindow = SeenWindow::new(state.cfg.seen_window);
     let mut tick: u32 = 0;
 
     loop {
-        // Refresh the on-chain revoked set and re-advertise periodically (provider records expire).
         if tick % 20 == 0 {
-            if let Ok(pairs) = client.revoked().await {
-                revoked = pairs
-                    .into_iter()
-                    .filter_map(|(issuer, nonce)| {
-                        hex::decode(&issuer).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).map(|i| (i, nonce))
-                    })
-                    .collect();
-            }
-            let _ = client.advertise_service(SERVICE_HOST).await;
-            for cid in &held.cids {
-                let _ = client.advertise_service(&service_for(cid)).await;
-            }
+            refresh_revoked(client, &state).await;
+            readvertise(client, &state).await;
+        }
+        // Garbage-collect roughly every ~30s (60 ticks at 500ms) and on startup (tick 0).
+        if tick % 60 == 0 {
+            run_gc(client, &state).await;
+            let s = state.metrics.snapshot();
+            let held = state.held.lock().await;
+            tracing::info!(
+                accepted = s.offers_accepted, declined = s.offers_declined, failed = s.offers_failed,
+                audits_ok = s.audits_passed, audits_fail = s.audits_failed, evictions = s.gc_evictions,
+                denied = s.auth_denied, held = held.len(), held_bytes = held.total_bytes(),
+                "ce-pin host metrics"
+            );
         }
         tick = tick.wrapping_add(1);
 
-        for m in client.messages().await.unwrap_or_default() {
+        let msgs = client.messages().await.unwrap_or_default();
+        for m in msgs {
             let Some(token) = m.reply_token else { continue };
             if !m.topic.starts_with(TOPIC_PREFIX) || !seen.insert(token) {
                 continue;
             }
-            let reply =
-                handle(client, &m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &mut held, &held_path)
-                    .await;
-            if let Err(e) = client.reply(token, &reply).await {
-                tracing::warn!(error = %e, "failed to send mesh reply");
-            }
+            // Acquire a worker permit; spawn the handler so a slow fetch cannot block the loop.
+            let permit = match Arc::clone(&sem).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break, // semaphore closed: shutting down
+            };
+            let st = state.clone();
+            let client = client.clone();
+            tokio::spawn(async move {
+                let _permit = permit; // held for the duration of the request
+                let reply = handle(&client, &m.topic, &m.from, &m.payload_hex, &st).await;
+                if let Err(e) = client.reply(token, &reply).await {
+                    tracing::warn!(error = %e, "failed to send mesh reply");
+                }
+            });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
+/// Refresh the on-chain revoked set so a revoked capability stops authorizing within ~10s.
+async fn refresh_revoked(client: &CeClient, state: &HostState) {
+    if let Ok(pairs) = client.revoked().await {
+        let set: HashSet<([u8; 32], u64)> = pairs
+            .into_iter()
+            .filter_map(|(issuer, nonce)| {
+                hex::decode(&issuer).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).map(|i| (i, nonce))
+            })
+            .collect();
+        *state.revoked.lock().await = set;
+    }
+}
+
+/// Re-advertise the host service and every held CID (provider records expire on the DHT).
+async fn readvertise(client: &CeClient, state: &HostState) {
+    let _ = client.advertise_service(SERVICE_HOST).await;
+    let cids: Vec<String> = state.held.lock().await.entries.keys().cloned().collect();
+    for cid in cids {
+        let _ = client.advertise_service(&service_for(&cid)).await;
+    }
+}
+
+/// Background garbage collection: drop pins whose rent lease expired, then (if still over the disk
+/// budget) evict by expired > lowest-rent > LRU until the held total fits. Persists the result
+/// atomically and stops advertising dropped CIDs.
+async fn run_gc(client: &CeClient, state: &HostState) {
+    let height = client.status().await.map(|s| s.height).unwrap_or(0);
+    let mut dropped: Vec<String> = Vec::new();
+    {
+        let mut held = state.held.lock().await;
+        // 1. Expired leases.
+        for cid in held.expired(height) {
+            held.remove(&cid);
+            dropped.push(cid);
+        }
+        // 2. Capacity: evict to fit the budget.
+        let victims = held.evict_to_fit(state.cfg.capacity_bytes, height);
+        for cid in victims {
+            held.remove(&cid);
+            dropped.push(cid);
+        }
+        if !dropped.is_empty() {
+            if let Err(e) = held.save(&state.held_path) {
+                tracing::warn!(error = %e, "GC could not persist held-set");
+            }
+        }
+    }
+    if !dropped.is_empty() {
+        state.metrics.add_evictions(dropped.len() as u64);
+        tracing::info!(count = dropped.len(), "GC dropped pins (expired or over-budget)");
+        // We intentionally do NOT re-advertise the dropped CIDs; their provider records lapse.
+    }
+}
+
 /// Authorize, dispatch, and serialize a reply. Any error becomes a typed negative reply so the
 /// requester always gets a structured answer instead of a timeout.
-#[allow(clippy::too_many_arguments)]
-async fn handle(
-    client: &CeClient,
-    topic: &str,
-    from_hex: &str,
-    payload_hex: &str,
-    host_id: &[u8; 32],
-    roots: &[[u8; 32]],
-    revoked: &HashSet<([u8; 32], u64)>,
-    held: &mut HeldSet,
-    held_path: &Path,
-) -> Vec<u8> {
+async fn handle(client: &CeClient, topic: &str, from_hex: &str, payload_hex: &str, state: &HostState) -> Vec<u8> {
     let action = topic.strip_prefix(TOPIC_PREFIX).unwrap_or(topic);
-    match handle_inner(client, action, from_hex, payload_hex, host_id, roots, revoked, held, held_path).await {
+    match handle_inner(client, action, from_hex, payload_hex, state).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::debug!(action, error = %e, "request denied/failed");
-            // Encode a generic negative reply shaped like the per-action resp (callers tolerate it).
-            serde_json::to_vec(&serde_json::json!({ "accepted": false, "held": false, "released": false, "reason": e.to_string() }))
-                .unwrap_or_default()
+            serde_json::to_vec(&serde_json::json!({
+                "accepted": false, "held": false, "released": false, "renewed": false,
+                "reason": e.to_string()
+            }))
+            .unwrap_or_default()
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_inner(
     client: &CeClient,
     action: &str,
     from_hex: &str,
     payload_hex: &str,
-    host_id: &[u8; 32],
-    roots: &[[u8; 32]],
-    revoked: &HashSet<([u8; 32], u64)>,
-    held: &mut HeldSet,
-    held_path: &Path,
+    state: &HostState,
 ) -> Result<Vec<u8>> {
     let payload = hex::decode(payload_hex).context("payload hex")?;
     let from: [u8; 32] = hex::decode(from_hex)
@@ -123,61 +228,138 @@ async fn handle_inner(
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow!("bad sender id"))?;
 
-    // Every request shares a `caps` field; the ability required is action-specific.
     let ability = match action {
         "offer" => ABILITY_STORE,
         "audit" => ABILITY_AUDIT,
         "status" => ABILITY_READ,
+        "renew" => ABILITY_RENEW,
         "release" => ABILITY_RELEASE,
         other => return Err(anyhow!("unknown pin action '{other}'")),
     };
     let caps = caps_of(&payload)?;
 
     let chain: Vec<SignedCapability> = decode_chain(&caps).map_err(|_| anyhow!("bad capability"))?;
+    let revoked = state.revoked.lock().await.clone();
     let is_revoked = |issuer: &[u8; 32], nonce: u64| revoked.contains(&(*issuer, nonce));
-    authorize(host_id, roots, &[], now(), &from, ability, &chain, &is_revoked)
-        .map_err(|e| anyhow!("denied: {e}"))?;
+    if let Err(e) = authorize(&state.host_id, &state.roots, &[], now(), &from, ability, &chain, &is_revoked) {
+        state.metrics.auth_deny();
+        return Err(anyhow!("denied: {e}"));
+    }
 
     match action {
         "offer" => {
             let req: OfferReq = serde_json::from_slice(&payload)?;
-            let resp = do_offer(client, &req, held, held_path).await;
+            let resp = do_offer(client, &req, from_hex, state).await;
             Ok(serde_json::to_vec(&resp)?)
         }
         "audit" => {
             let req: AuditReq = serde_json::from_slice(&payload)?;
-            let resp = do_audit(client, &req, held).await;
+            let resp = do_audit(client, &req, state).await;
             Ok(serde_json::to_vec(&resp)?)
         }
         "status" => {
             let req: StatusReq = serde_json::from_slice(&payload)?;
-            let resp = do_status(client, &req, held).await;
+            let resp = do_status(client, &req, state).await;
+            Ok(serde_json::to_vec(&resp)?)
+        }
+        "renew" => {
+            let req: RenewReq = serde_json::from_slice(&payload)?;
+            let resp = do_renew(&req, state).await;
             Ok(serde_json::to_vec(&resp)?)
         }
         "release" => {
             let req: ReleaseReq = serde_json::from_slice(&payload)?;
-            let released = held.remove(&req.cid);
-            held.save(held_path)?;
-            Ok(serde_json::to_vec(&ReleaseResp { released, reason: None })?)
+            let mut held = state.held.lock().await;
+            // Was it held before we removed it? (remove returns freed bytes, which is 0 for a
+            // 0-byte commitment, so check membership first to report `released` accurately.)
+            let was_held = held.contains(&req.cid);
+            held.remove(&req.cid);
+            held.save(&state.held_path)?;
+            drop(held);
+            if was_held {
+                state.metrics.release();
+            }
+            Ok(serde_json::to_vec(&ReleaseResp { released: was_held, reason: None })?)
         }
         _ => unreachable!("action validated above"),
     }
 }
 
-/// Fetch the object (CID-verified by `get_object`) and commit to holding it.
-async fn do_offer(client: &CeClient, req: &OfferReq, held: &mut HeldSet, held_path: &Path) -> OfferResp {
-    match client.get_object(&req.cid).await {
-        Ok(bytes) => {
-            held.insert(req.cid.clone());
-            if let Err(e) = held.save(held_path) {
-                tracing::warn!(error = %e, "could not persist held-set");
+/// Admission-check, fetch the object (CID-verified by `get_object`, with a timeout), and commit to
+/// holding it with full accounting.
+async fn do_offer(client: &CeClient, req: &OfferReq, publisher: &str, state: &HostState) -> OfferResp {
+    // Admission BEFORE any fetch: size, rent, and (post-expired-GC) capacity. Re-offering a CID we
+    // already hold is always admissible (idempotent refresh) and does not double-count capacity.
+    let already_held = state.held.lock().await.contains(&req.cid);
+    if !already_held {
+        let held_bytes = {
+            // Opportunistically GC expired pins first so capacity reflects reclaimable space.
+            let height = client.status().await.map(|s| s.height).unwrap_or(0);
+            let mut held = state.held.lock().await;
+            for cid in held.expired(height) {
+                held.remove(&cid);
             }
-            let _ = client.advertise_service(&service_for(&req.cid)).await;
-            tracing::info!(cid = %req.cid, bytes = bytes.len(), "accepted pin");
-            OfferResp { accepted: true, stored_bytes: bytes.len() as u64, reason: None }
+            held.total_bytes()
+        };
+        if let Err(reason) = state.cfg.admit(req.bytes_len, &req.rent_per_gb_hour, held_bytes) {
+            state.metrics.offer_declined();
+            tracing::info!(cid = %req.cid, %reason, "declined pin (admission)");
+            return OfferResp { accepted: false, stored_bytes: 0, reason: Some(reason) };
         }
-        Err(e) => OfferResp { accepted: false, stored_bytes: 0, reason: Some(format!("fetch failed: {e}")) },
     }
+
+    // Fetch with a timeout so a stalled mesh pull cannot pin a worker for the full SDK timeout.
+    let fetched = tokio::time::timeout(state.cfg.fetch_timeout, client.get_object(&req.cid)).await;
+    let bytes = match fetched {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            state.metrics.offer_failed();
+            return OfferResp { accepted: false, stored_bytes: 0, reason: Some(format!("fetch failed: {e}")) };
+        }
+        Err(_) => {
+            state.metrics.offer_failed();
+            return OfferResp {
+                accepted: false,
+                stored_bytes: 0,
+                reason: Some(format!("fetch timed out after {}s", state.cfg.fetch_timeout.as_secs())),
+            };
+        }
+    };
+
+    // Re-check the ACTUAL fetched size against the max — a lying `bytes_len` cannot smuggle a huge
+    // object past the size gate.
+    let actual = bytes.len() as u64;
+    if !already_held && actual > state.cfg.max_object_bytes {
+        state.metrics.offer_declined();
+        return OfferResp {
+            accepted: false,
+            stored_bytes: 0,
+            reason: Some(format!(
+                "fetched object is {actual} bytes, over host max {}",
+                state.cfg.max_object_bytes
+            )),
+        };
+    }
+
+    let entry = HeldEntry {
+        bytes: actual,
+        rent_per_gb_hour: req.rent_per_gb_hour.clone(),
+        expiry_height: req.expiry_height,
+        pinned_at: now(),
+        last_access: now(),
+        publisher: publisher.to_string(),
+    };
+    {
+        let mut held = state.held.lock().await;
+        held.insert(req.cid.clone(), entry);
+        if let Err(e) = held.save(&state.held_path) {
+            tracing::warn!(error = %e, "could not persist held-set");
+        }
+    }
+    let _ = client.advertise_service(&service_for(&req.cid)).await;
+    state.metrics.offer_accepted();
+    tracing::info!(cid = %req.cid, bytes = actual, "accepted pin");
+    OfferResp { accepted: true, stored_bytes: actual, reason: None }
 }
 
 /// Answer a proof-of-retrievability challenge: prove the challenged chunk is held **by this host
@@ -186,63 +368,88 @@ async fn do_offer(client: &CeClient, req: &OfferReq, held: &mut HeldSet, held_pa
 /// SECURITY (finding H3): a PoR audit must prove *retrievability-here*, not *availability-somewhere*.
 /// The SDK's `get_blob` is local-first but falls back to a mesh fetch-by-hash, so a host that
 /// discarded the bytes could transparently re-pull the challenged chunk from another paid replica
-/// and forge a passing proof — defeating the economic guarantee that this host still holds the data.
-/// To close that hole the audit is gated on this host's own authoritative local record before any
-/// blob read, and FAILS for a CID this host has not locally committed to.
+/// and forge a passing proof. The audit is therefore gated on this host's authoritative committed
+/// held-set BEFORE any blob read, and FAILS for a CID this host has not locally committed to (never
+/// pinned, released, or GC-evicted) — so a sibling replica's copy can never satisfy our challenge.
 ///
-/// The gate is the host's committed held-set: a CID is in `held` only after [`do_offer`] fetched the
-/// object and recorded it, and it is removed by `pin/release`. An audit for any CID not in that set
-/// (never pinned, or released — i.e. "not held locally") fails here without touching the network, so
-/// a sibling replica's copy can never satisfy our challenge.
-///
-/// TODO(node/SDK support needed for a byte-level local-only PoR): the node's `GET /blobs/:hash`
-/// handler (`ce/crates/ce-node/src/api.rs::get_blob`) takes only the path and ALWAYS falls back to
-/// `fetch_chunk_from_mesh` on a local miss; it ignores query parameters, so there is no app-tier way
-/// to force a no-mesh read of the actual bytes. The sound fix is a node-side local-only read — e.g.
-/// honoring `GET /blobs/:hash?local=1` (or a dedicated `GET /blobs/:hash/local`) by returning 404 on
-/// a local miss instead of pulling from the mesh — surfaced in the SDK as `CeClient::get_blob_local`.
-/// Until that lands, the held-set gate above is the strictest enforceable defence from this app: it
-/// already fails an audit for an un-held CID. When the endpoint exists, additionally read the
-/// manifest and chunk through it so even a held-but-garbage-collected CID fails.
-async fn do_audit(client: &CeClient, req: &AuditReq, held: &HeldSet) -> AuditResp {
-    // Local-only gate: we must have committed to hold this object. This is the host's own
-    // authoritative record; an audit for a CID we never pinned (or released) fails before any read,
-    // so the bytes can NEVER be sourced from another replica to forge a passing proof.
-    if !audit_held_locally(held, &req.cid) {
+/// TODO(node/SDK support for byte-level local-only PoR): the node's `GET /blobs/:hash` always falls
+/// back to `fetch_chunk_from_mesh` on a local miss and ignores query params, so there is no app-tier
+/// way to force a no-mesh byte read. The sound fix is a node-side local-only read (`?local=1` -> 404
+/// on a local miss) surfaced as `CeClient::get_blob_local`; until then the held-set gate is the
+/// strictest enforceable defence (it already fails an audit for an un-held CID). See README "PoR".
+async fn do_audit(client: &CeClient, req: &AuditReq, state: &HostState) -> AuditResp {
+    if !audit_held_locally(&*state.held.lock().await, &req.cid) {
+        state.metrics.audit_failed();
         return AuditResp { proof: None, reason: Some("not held locally".into()) };
     }
-    // Resolve the manifest to map chunk_index -> chunk CID, then hash the challenged chunk. (These
-    // reads go through the SDK; the local-only guarantee for the bytes themselves awaits the node
-    // endpoint described above — tracked by the TODO. The held-set gate is what closes H3 today.)
-    let manifest = match client.get_blob(&req.cid).await.ok().and_then(|b| serde_json::from_slice::<ce_rs::Manifest>(&b).ok()) {
+    let manifest = match client
+        .get_blob(&req.cid)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice::<ce_rs::Manifest>(&b).ok())
+    {
         Some(m) => m,
-        None => return AuditResp { proof: None, reason: Some("manifest unavailable".into()) },
+        None => {
+            state.metrics.audit_failed();
+            return AuditResp { proof: None, reason: Some("manifest unavailable".into()) };
+        }
     };
     let Some(chunk_cid) = manifest.chunks.get(req.chunk_index as usize) else {
+        state.metrics.audit_failed();
         return AuditResp { proof: None, reason: Some("chunk index out of range".into()) };
     };
     match client.get_blob(chunk_cid).await {
-        Ok(chunk) => AuditResp { proof: Some(crate::audit::prove(&chunk, &req.nonce)), reason: None },
-        Err(e) => AuditResp { proof: None, reason: Some(format!("chunk unavailable: {e}")) },
+        Ok(chunk) => {
+            state.metrics.audit_passed();
+            state.held.lock().await.touch(&req.cid, now());
+            AuditResp { proof: Some(crate::audit::prove(&chunk, &req.nonce)), reason: None }
+        }
+        Err(e) => {
+            state.metrics.audit_failed();
+            AuditResp { proof: None, reason: Some(format!("chunk unavailable: {e}")) }
+        }
     }
 }
 
 /// The H3 local-only audit gate, factored out so it is unit-testable without a node: a host may
-/// answer a PoR challenge for `cid` only if `cid` is in its committed held-set. This is the
-/// authoritative "do we hold this locally?" decision the audit makes before any (mesh-capable) read.
-/// Returns true iff the host has locally committed to `cid` (and not released it).
+/// answer a PoR challenge for `cid` only if `cid` is in its committed held-set.
 fn audit_held_locally(held: &HeldSet, cid: &str) -> bool {
-    held.cids.contains(cid)
+    held.contains(cid)
+}
+
+/// Extend the rent lease on a held CID. Fails if the host does not hold it (a renew is not a back
+/// door to pin a new object — use `pin/offer` for that).
+async fn do_renew(req: &RenewReq, state: &HostState) -> RenewResp {
+    let mut held = state.held.lock().await;
+    let Some(entry) = held.entries.get_mut(&req.cid) else {
+        return RenewResp { renewed: false, expiry_height: 0, reason: Some("not held locally".into()) };
+    };
+    // Only ever extend the lease, never shorten it (a publisher cannot use renew to drop the lease).
+    if req.expiry_height > entry.expiry_height || entry.expiry_height == 0 {
+        entry.expiry_height = req.expiry_height;
+    }
+    if !req.rent_per_gb_hour.trim().is_empty() {
+        entry.rent_per_gb_hour = req.rent_per_gb_hour.clone();
+    }
+    entry.last_access = now();
+    let new_expiry = entry.expiry_height;
+    if let Err(e) = held.save(&state.held_path) {
+        tracing::warn!(error = %e, "could not persist held-set after renew");
+    }
+    RenewResp { renewed: true, expiry_height: new_expiry, reason: None }
 }
 
 /// Cheap liveness: report whether we still serve this CID (committed in the held-set and the manifest
 /// resolves locally).
-async fn do_status(client: &CeClient, req: &StatusReq, held: &HeldSet) -> StatusResp {
-    if !held.cids.contains(&req.cid) {
+async fn do_status(client: &CeClient, req: &StatusReq, state: &HostState) -> StatusResp {
+    if !state.held.lock().await.contains(&req.cid) {
         return StatusResp { held: false, bytes: 0 };
     }
     match client.get_blob(&req.cid).await.ok().and_then(|b| serde_json::from_slice::<ce_rs::Manifest>(&b).ok()) {
-        Some(m) => StatusResp { held: true, bytes: m.total_size },
+        Some(m) => {
+            state.held.lock().await.touch(&req.cid, now());
+            StatusResp { held: true, bytes: m.total_size }
+        }
         None => StatusResp { held: false, bytes: 0 },
     }
 }
@@ -266,32 +473,31 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The set of CIDs this host has committed to hold, persisted so a restart keeps serving them.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct HeldSet {
-    cids: HashSet<String>,
+/// A bounded FIFO set of recently-seen reply tokens. `insert` returns `true` if the token was new
+/// (first time seen) and `false` if it is a duplicate within the window. When the window is full the
+/// oldest token is evicted, so memory is capped regardless of host uptime.
+struct SeenWindow {
+    cap: usize,
+    set: HashSet<u64>,
+    order: VecDeque<u64>,
 }
 
-impl HeldSet {
-    fn load(path: &Path) -> Result<Self> {
-        match std::fs::read(path) {
-            Ok(b) => Ok(serde_json::from_slice(&b).unwrap_or_default()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HeldSet::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+impl SeenWindow {
+    fn new(cap: usize) -> Self {
+        SeenWindow { cap: cap.max(1), set: HashSet::new(), order: VecDeque::new() }
+    }
+    fn insert(&mut self, token: u64) -> bool {
+        if self.set.contains(&token) {
+            return false;
         }
-    }
-    fn save(&self, path: &Path) -> Result<()> {
-        if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p)?;
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
-        Ok(())
-    }
-    fn insert(&mut self, cid: String) {
-        self.cids.insert(cid);
-    }
-    fn remove(&mut self, cid: &str) -> bool {
-        self.cids.remove(cid)
+        self.order.push_back(token);
+        self.set.insert(token);
+        true
     }
 }
 
@@ -309,50 +515,62 @@ fn held_set_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// Build a held-set from a list of CIDs, as the host would have after accepting those pins.
     fn held_with(cids: &[&str]) -> HeldSet {
         let mut h = HeldSet::default();
         for c in cids {
-            h.insert((*c).to_string());
+            h.insert(
+                (*c).to_string(),
+                HeldEntry {
+                    bytes: 10,
+                    rent_per_gb_hour: "0".into(),
+                    expiry_height: 0,
+                    pinned_at: 0,
+                    last_access: 0,
+                    publisher: String::new(),
+                },
+            );
         }
         h
     }
 
     /// REGRESSION (finding H3): the audit gate must DENY a CID this host does not hold locally.
-    ///
-    /// Before the fix, `do_audit` had no held-set gate at all — it went straight to
-    /// `get_blob(cid)`, which falls back to a mesh fetch-by-hash, so a host that never held (or had
-    /// released) the bytes could re-fetch them from another replica and forge a passing proof. This
-    /// test pins down the new contract: an audit for a CID NOT in the local held-set is refused
-    /// before any (mesh-capable) read. It fails against the old gate-less behavior and passes now.
     #[test]
     fn audit_denied_for_cid_not_held_locally() {
         let held = held_with(&["held-cid-aaaa"]);
-        // A CID we DO hold passes the local-only gate.
         assert!(audit_held_locally(&held, "held-cid-aaaa"), "a locally-held CID must pass the gate");
-        // A CID we do NOT hold (never pinned, or released) is denied — it must not be answerable by
-        // re-fetching from a sibling replica.
         assert!(
             !audit_held_locally(&held, "not-held-cid-bbbb"),
             "an un-held CID must FAIL the audit gate (no re-fetch-from-mesh forgery)"
         );
     }
 
-    /// Releasing a pin removes it from the held-set, so a subsequent audit for it is denied: the
-    /// host can no longer prove retrievability-here once it has dropped the bytes.
+    /// Releasing a pin removes it from the held-set, so a subsequent audit for it is denied.
     #[test]
     fn audit_denied_after_release() {
         let mut held = held_with(&["cid-x"]);
         assert!(audit_held_locally(&held, "cid-x"));
-        let removed = held.remove("cid-x");
-        assert!(removed, "release must drop the CID from the held-set");
+        assert!(held.remove("cid-x") > 0, "release must drop the CID and free its bytes");
         assert!(!audit_held_locally(&held, "cid-x"), "a released CID must fail the audit gate");
     }
 
-    /// An empty held-set (fresh host that has accepted nothing) denies every audit.
+    /// An empty held-set (fresh host) denies every audit.
     #[test]
     fn empty_host_answers_no_audit() {
         let held = HeldSet::default();
         assert!(!audit_held_locally(&held, "anything"));
+    }
+
+    #[test]
+    fn seen_window_dedups_and_is_bounded() {
+        let mut w = SeenWindow::new(3);
+        assert!(w.insert(1), "first sighting is new");
+        assert!(!w.insert(1), "duplicate within window is rejected");
+        assert!(w.insert(2));
+        assert!(w.insert(3));
+        // Inserting a 4th evicts the oldest (1); the set never exceeds the cap.
+        assert!(w.insert(4));
+        assert!(w.set.len() <= 3, "window must stay bounded at cap");
+        // 1 was evicted, so it is considered "new" again (acceptable: it is far in the past).
+        assert!(w.insert(1));
     }
 }

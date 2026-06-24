@@ -26,7 +26,7 @@ ce-rs = { path = "../ce-rs" }
 ce-cap = { path = "../ce/crates/ce-cap" }
 # Identity is only needed by tests (to forge capability chains); kept as a dev-dependency below.
 
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

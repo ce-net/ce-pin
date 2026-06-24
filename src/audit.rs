@@ -35,6 +35,17 @@ pub fn challenge_index(beacon_hash: &str, cid: &str, chunk_count: usize) -> u64 
 /// Compute the PoR proof a host returns: `sha256(chunk_bytes || nonce_bytes)`, hex-encoded.
 /// `nonce_hex` is the auditor's random nonce; if it is not valid hex the raw bytes are used so a
 /// malformed nonce still produces a deterministic (and therefore comparable) result.
+///
+/// ```
+/// use ce_pin::audit::{prove, verify};
+/// let chunk = b"a pinned chunk of bytes";
+/// let proof = prove(chunk, "00ff00ff");
+/// // The host that still holds the bytes produces a verifying proof...
+/// assert!(verify(chunk, "00ff00ff", &proof));
+/// // ...but a host that lost the bytes (or a replayed proof under a new nonce) cannot.
+/// assert!(!verify(b"different bytes", "00ff00ff", &proof));
+/// assert!(!verify(chunk, "deadbeef", &proof));
+/// ```
 pub fn prove(chunk_bytes: &[u8], nonce_hex: &str) -> String {
     let nonce = hex::decode(nonce_hex).unwrap_or_else(|_| nonce_hex.as_bytes().to_vec());
     let mut h = Sha256::new();

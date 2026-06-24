@@ -88,4 +88,15 @@ log "running a proof-of-retrievability audit against the holder"
 CE_API_TOKEN="$(cat "$PUB_DATA/api.token")" CE_PIN_CAPS="$CAPS" \
   "$CE_PIN" --api "$PUB_API" --pinset "$WORK/pins.json" status "$CID" --caps "$CAPS" --audit || true
 
+# 8. Run a single auto-repair pass: it audits every replica and re-pins any that fell below the
+#    desired factor, paying accrued rent on healthy channels (the 'watch' daemon, one-shot here).
+log "running one auto-repair pass (ce-pin watch --once)"
+CE_API_TOKEN="$(cat "$PUB_DATA/api.token")" CE_PIN_CAPS="$CAPS" \
+  "$CE_PIN" --api "$PUB_API" --pinset "$WORK/pins.json" watch --once --caps "$CAPS" || true
+
+# 9. Extend the rent lease across holders.
+log "renewing the lease (ce-pin renew)"
+CE_API_TOKEN="$(cat "$PUB_DATA/api.token")" CE_PIN_CAPS="$CAPS" \
+  "$CE_PIN" --api "$PUB_API" --pinset "$WORK/pins.json" renew "$CID" --expiry-blocks 17280 --caps "$CAPS" || true
+
 log "demo complete."

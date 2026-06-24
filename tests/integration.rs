@@ -137,9 +137,9 @@ fn challenge_index_in_range() {
 #[test]
 fn placement_selects_best_hosts() {
     let cands = vec![
-        Candidate { node_id: "self".into(), delivered_work: 99, last_seen_secs: 1, mem_mb: 1 },
-        Candidate { node_id: "proven".into(), delivered_work: 10, last_seen_secs: 5, mem_mb: 1 },
-        Candidate { node_id: "newcomer".into(), delivered_work: 0, last_seen_secs: 5, mem_mb: 1 },
+        Candidate { node_id: "self".into(), delivered_work: 99, last_seen_secs: 1, mem_mb: 1, fault_domain: String::new() },
+        Candidate { node_id: "proven".into(), delivered_work: 10, last_seen_secs: 5, mem_mb: 1, fault_domain: String::new() },
+        Candidate { node_id: "newcomer".into(), delivered_work: 0, last_seen_secs: 5, mem_mb: 1, fault_domain: String::new() },
     ];
     let picked = select(&cands, 2, &["self".to_string()]);
     assert_eq!(picked, ["proven", "newcomer"]);

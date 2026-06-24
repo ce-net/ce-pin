@@ -26,10 +26,14 @@
 pub mod audit;
 pub mod caps;
 pub mod client;
+pub mod config;
+pub mod held;
 pub mod host;
+pub mod metrics;
 pub mod pinset;
 pub mod placement;
 pub mod proto;
+pub mod repair;
 
 /// Load accepted capability root keys for a pinning host: 64-hex NodeIds, one per line, `#`
 /// comments allowed. Looked up at `$CE_PIN_ROOTS`, else `$CE_DATA_DIR/roots`, else
