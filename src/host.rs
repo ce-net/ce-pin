@@ -11,20 +11,23 @@
 //!   - `pin/renew`   -> extend the rent lease on a held CID;
 //!   - `pin/release` -> drop the pin.
 //!
+//! The inbound serve loop is [`ce_rs::serve`] — the shared mesh-app serving loop (SSE inbox push +
+//! reply-token de-duplication + reconnect/backoff) — so this app no longer hand-rolls its own poll
+//! loop. The host supplies a [`Handler`] that authorizes and dispatches `pin/*` requests; periodic
+//! maintenance (revocation refresh, re-advertisement, GC) runs on an independent timer task.
+//!
 //! Robustness properties (vs the original MVP):
 //!   * **Admission control** ([`crate::config::HostConfig`]): rejects oversized objects, below-minimum
 //!     rent, and offers that would exceed the host's disk budget — closing the DoS / pricing-fiction.
 //!   * **Capacity accounting + GC**: the held-set tracks bytes per CID; a background loop evicts
 //!     expired-then-lowest-rent-then-LRU pins to stay under budget and drops past-lease pins.
-//!   * **Concurrency**: `pin/*` requests are served on a bounded worker pool (a [`tokio::sync::Semaphore`]),
-//!     removing the head-of-line blocking of the old single-task loop; the held-set is an
-//!     `Arc<Mutex<..>>` so concurrent handlers are race-free, and each offer's fetch has a timeout.
-//!   * **Bounded memory**: the de-dup `seen` reply-token window is size-capped (FIFO eviction), so a
-//!     long-lived host does not leak.
+//!   * **Shared serve loop**: `ce_rs::serve` de-duplicates redelivered requests (bounded set) and
+//!     reconnects to the inbox with capped backoff; the held-set is an `Arc<Mutex<..>>` so the
+//!     handler is race-free against the maintenance task, and each offer's fetch has a timeout.
 //!   * **Atomic, corruption-safe persistence**: the held-set is written temp-file + fsync + rename and
 //!     a corrupt file is preserved (not silently dropped).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +35,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use ce_cap::{SignedCapability, authorize, decode_chain};
 use ce_rs::CeClient;
-use tokio::sync::{Mutex, Semaphore};
+use ce_rs::serve::{Handler, Request, serve_where};
+use tokio::sync::Mutex;
 
 use crate::config::HostConfig;
 use crate::held::{HeldEntry, HeldSet};
@@ -95,52 +99,75 @@ pub async fn serve_with(client: &CeClient, roots: Vec<[u8; 32]>, cfg: HostConfig
         metrics: Arc::new(HostMetrics::new()),
     };
 
-    let sem = Arc::new(Semaphore::new(state.cfg.max_concurrent));
-    // Bounded de-dup window: a FIFO of recently-seen reply tokens, capped so memory cannot grow.
-    let mut seen: SeenWindow = SeenWindow::new(state.cfg.seen_window);
-    let mut tick: u32 = 0;
+    // Periodic maintenance (revocation refresh + re-advertisement + GC + metrics) runs on its own
+    // timer task, decoupled from inbound message flow so it keeps ticking under load or idle.
+    let maint = tokio::spawn(maintenance_loop(client.clone(), state.clone()));
 
+    // The inbound serve loop is `ce_rs::serve`: it pushes from the SSE inbox, de-duplicates
+    // redelivered reply tokens, reconnects with backoff, and replies for us. We accept any `pin/*`
+    // topic and dispatch through the host handler. ctrl_c shuts it down cleanly.
+    let pin_handler = PinHandler { client: client.clone(), state: state.clone() };
+    let result = serve_where(
+        client,
+        &[],
+        |topic| topic.starts_with(TOPIC_PREFIX),
+        &pin_handler,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
+    .await;
+
+    maint.abort();
+    result
+}
+
+/// The host's mesh-request handler: authorize the signed capability chain, dispatch the `pin/*`
+/// action, and return the serialized reply. `ce_rs::serve` owns the inbox/dedup/reconnect/reply
+/// loop and calls this once per request; the handler never blocks on anything unbounded (each
+/// offer's fetch is timeout-bounded in [`do_offer`]).
+struct PinHandler {
+    client: CeClient,
+    state: HostState,
+}
+
+impl Handler for PinHandler {
+    async fn handle(&self, req: Request) -> Vec<u8> {
+        handle(&self.client, &req.topic, &req.from, &hex::encode(&req.payload), &self.state).await
+    }
+}
+
+/// Background maintenance: refresh the revoked set + re-advertise every ~10s, GC + log metrics
+/// every ~30s. Runs until aborted (on shutdown). Mirrors the cadence of the old poll-tick loop
+/// (20 ticks * 500ms ~= 10s; 60 ticks ~= 30s) without coupling it to inbound traffic.
+async fn maintenance_loop(client: CeClient, state: HostState) {
+    // Run the startup pass immediately (tick 0 in the old loop did revoked+readvertise+gc).
+    refresh_revoked(&client, &state).await;
+    readvertise(&client, &state).await;
+    run_gc(&client, &state).await;
+
+    let mut every_10s = tokio::time::interval(Duration::from_secs(10));
+    let mut every_30s = tokio::time::interval(Duration::from_secs(30));
+    every_10s.tick().await; // consume the immediate first tick (startup pass already ran)
+    every_30s.tick().await;
     loop {
-        if tick % 20 == 0 {
-            refresh_revoked(client, &state).await;
-            readvertise(client, &state).await;
-        }
-        // Garbage-collect roughly every ~30s (60 ticks at 500ms) and on startup (tick 0).
-        if tick % 60 == 0 {
-            run_gc(client, &state).await;
-            let s = state.metrics.snapshot();
-            let held = state.held.lock().await;
-            tracing::info!(
-                accepted = s.offers_accepted, declined = s.offers_declined, failed = s.offers_failed,
-                audits_ok = s.audits_passed, audits_fail = s.audits_failed, evictions = s.gc_evictions,
-                denied = s.auth_denied, held = held.len(), held_bytes = held.total_bytes(),
-                "ce-pin host metrics"
-            );
-        }
-        tick = tick.wrapping_add(1);
-
-        let msgs = client.messages().await.unwrap_or_default();
-        for m in msgs {
-            let Some(token) = m.reply_token else { continue };
-            if !m.topic.starts_with(TOPIC_PREFIX) || !seen.insert(token) {
-                continue;
+        tokio::select! {
+            _ = every_10s.tick() => {
+                refresh_revoked(&client, &state).await;
+                readvertise(&client, &state).await;
             }
-            // Acquire a worker permit; spawn the handler so a slow fetch cannot block the loop.
-            let permit = match Arc::clone(&sem).acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => break, // semaphore closed: shutting down
-            };
-            let st = state.clone();
-            let client = client.clone();
-            tokio::spawn(async move {
-                let _permit = permit; // held for the duration of the request
-                let reply = handle(&client, &m.topic, &m.from, &m.payload_hex, &st).await;
-                if let Err(e) = client.reply(token, &reply).await {
-                    tracing::warn!(error = %e, "failed to send mesh reply");
-                }
-            });
+            _ = every_30s.tick() => {
+                run_gc(&client, &state).await;
+                let s = state.metrics.snapshot();
+                let held = state.held.lock().await;
+                tracing::info!(
+                    accepted = s.offers_accepted, declined = s.offers_declined, failed = s.offers_failed,
+                    audits_ok = s.audits_passed, audits_fail = s.audits_failed, evictions = s.gc_evictions,
+                    denied = s.auth_denied, held = held.len(), held_bytes = held.total_bytes(),
+                    "ce-pin host metrics"
+                );
+            }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -473,33 +500,9 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// A bounded FIFO set of recently-seen reply tokens. `insert` returns `true` if the token was new
-/// (first time seen) and `false` if it is a duplicate within the window. When the window is full the
-/// oldest token is evicted, so memory is capped regardless of host uptime.
-struct SeenWindow {
-    cap: usize,
-    set: HashSet<u64>,
-    order: VecDeque<u64>,
-}
-
-impl SeenWindow {
-    fn new(cap: usize) -> Self {
-        SeenWindow { cap: cap.max(1), set: HashSet::new(), order: VecDeque::new() }
-    }
-    fn insert(&mut self, token: u64) -> bool {
-        if self.set.contains(&token) {
-            return false;
-        }
-        if self.order.len() >= self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
-            }
-        }
-        self.order.push_back(token);
-        self.set.insert(token);
-        true
-    }
-}
+// Reply-token de-duplication used to live here (a bounded `SeenWindow`); it now lives in
+// `ce_rs::serve`, which de-duplicates redelivered requests inside the shared serve loop. The
+// `seen_window` knob on `HostConfig` is retained for config compatibility.
 
 /// Where the host records its held CIDs: `<config dir>/ce-pin/held.json`, overridable via `$CE_PIN_DIR`.
 fn held_set_path() -> PathBuf {
@@ -558,19 +561,5 @@ mod tests {
     fn empty_host_answers_no_audit() {
         let held = HeldSet::default();
         assert!(!audit_held_locally(&held, "anything"));
-    }
-
-    #[test]
-    fn seen_window_dedups_and_is_bounded() {
-        let mut w = SeenWindow::new(3);
-        assert!(w.insert(1), "first sighting is new");
-        assert!(!w.insert(1), "duplicate within window is rejected");
-        assert!(w.insert(2));
-        assert!(w.insert(3));
-        // Inserting a 4th evicts the oldest (1); the set never exceeds the cap.
-        assert!(w.insert(4));
-        assert!(w.set.len() <= 3, "window must stay bounded at cap");
-        // 1 was evicted, so it is considered "new" again (acceptable: it is far in the past).
-        assert!(w.insert(1));
     }
 }
