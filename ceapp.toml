@@ -1,0 +1,30 @@
+# ce-pin — content-availability / paid blob-pinning over CE (IPFS-style). Install through
+# the one `ce` binary and `ce app daemon enable ce-pin` to contribute durable pinning capacity.
+
+[app]
+name    = "ce-pin"
+version = "0.1.0"
+summary = "Content-availability / paid blob-pinning over CE (IPFS-style pinning service)"
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+
+[native]
+bin = "ce-pin"
+[native.artifacts]
+"darwin-amd64" = "f7b2b4e159d72c5f89b6714e6881bf5709abb846fff151fbdf6348cea7420e68"
+"linux-amd64"  = "bbe6cf3918d0f1e3a39b50546bea5a34c0e702e4d8e313de1034a9893b440a23"
+
+[deps]
+# Stores pinned blobs in the local node's content-addressed store; pin deals are ce-cap-gated.
+
+[sandbox]
+tier       = "none"
+net        = "loopback"
+capability = "inherit"
+
+[daemon]
+# `ce-pin serve` hosts pinned content. Deliberate opt-in (a local install does not auto-enable);
+# enable it on the devices you want contributing storage.
+enabled = true
+args    = ["serve"]
+restart = "on-failure"
