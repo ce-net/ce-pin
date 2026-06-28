@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use ce_cap::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
 use ce_identity::Identity;
 use ce_pin::audit;
 use ce_pin::pinset::{Entry, PinJob, PinSet, Replica};

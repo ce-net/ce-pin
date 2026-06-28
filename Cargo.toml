@@ -23,9 +23,9 @@ path = "src/main.rs"
 # discovery, atlas/history, payment channels. The `serve` feature pulls in `ce_rs::serve` — the
 # shared mesh-app serving loop (SSE inbox + reply-token de-dup + reconnect/backoff) that the host
 # uses instead of hand-rolling its own poll loop. Depended on by path for the MVP per the build plan.
-ce-rs = { path = "../ce-rs", features = ["serve"] }
+ce-rs = { git = "https://github.com/ce-net/ce-rs", features = ["serve"] }
 # The capability verifier primitive — host loops authorize a signed attenuating chain before pinning.
-ce-cap = { path = "../ce/crates/ce-cap" }
+ce-iam-core = { git = "https://github.com/ce-net/ce-iam" }
 # Identity is only needed by tests (to forge capability chains); kept as a dev-dependency below.
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
@@ -40,5 +40,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
 
 [dev-dependencies]
-ce-identity = { path = "../ce/crates/ce-identity" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
 proptest = "1"

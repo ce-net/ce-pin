@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_identity::Identity;
 use ce_pin::proto::{ABILITY_AUDIT, ABILITY_READ, ABILITY_STORE};
 use ce_rs::CeClient;

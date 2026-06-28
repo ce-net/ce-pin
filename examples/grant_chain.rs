@@ -13,7 +13,7 @@
 //! This mirrors the production `ce grant <publisher> --can pin:store,pin:audit` workflow without
 //! needing a running node, so you can see precisely what the host checks.
 
-use ce_cap::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
 use ce_identity::Identity;
 use ce_pin::proto::{ABILITY_RELEASE, ABILITY_STORE};
 
